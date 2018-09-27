@@ -35,6 +35,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <queue>
 
 namespace graphene { namespace chain {
 
@@ -87,56 +88,75 @@ void database::reindex( fc::path data_dir )
    size_t total_block_size = _block_id_to_block.total_block_size();
    const auto& gpo = get_global_properties();
    const fc::time_point_sec now( fc::time_point::now() );
-   for( uint32_t i = head_block_num() + 1; i <= last_block_num; ++i )
+   std::queue< std::pair< signed_block, fc::future< void > > > blocks;
+   uint32_t next_block_num = head_block_num() + 1;
+   uint32_t i = next_block_num;
+   while( next_block_num <= last_block_num || !blocks.empty() )
    {
-      if( i % 10000 == 0 ) 
+      if( next_block_num <= last_block_num && blocks.size() < 20 )
       {
-         total_processed_block_size = _block_id_to_block.blocks_current_position();
-
-         ilog(
-            "   [by size: ${size}%   ${processed} of ${total}]   [by num: ${num}%   ${i} of ${last}]",
-            ("size", double(total_processed_block_size) / total_block_size * 100)
-            ("processed", total_processed_block_size)
-            ("total", total_block_size)
-            ("num", double(i*100)/last_block_num)
-            ("i", i)
-            ("last", last_block_num)
-         );
-      }
-      if( i == flush_point )
-      {
-         ilog( "Writing database to disk at block ${i}", ("i",i) );
-         flush();
-         ilog( "Done" );
-      }
-      if( head_block_time() >= now - gpo.parameters.maximum_time_until_expiration )
-         skip &= ~skip_transaction_dupe_check;
-      fc::optional< signed_block > block = _block_id_to_block.fetch_by_number(i);
-      if( !block.valid() )
-      {
-         wlog( "Reindexing terminated due to gap:  Block ${i} does not exist!", ("i", i) );
-         uint32_t dropped_count = 0;
-         while( true )
+         fc::optional< signed_block > block = _block_id_to_block.fetch_by_number( next_block_num++ );
+         if( block.valid() )
          {
-            fc::optional< block_id_type > last_id = _block_id_to_block.last_id();
-            // this can trigger if we attempt to e.g. read a file that has block #2 but no block #1
-            if( !last_id.valid() )
-               break;
-            // we've caught up to the gap
-            if( block_header::num_from_id( *last_id ) <= i )
-               break;
-            _block_id_to_block.remove( *last_id );
-            dropped_count++;
+            blocks.emplace( std::move(*block), fc::future<void>() );
+            blocks.back().second = precompute_parallel( blocks.back().first, skip );
          }
-         wlog( "Dropped ${n} blocks from after the gap", ("n", dropped_count) );
-         break;
+         else
+         {
+            wlog( "Reindexing terminated due to gap:  Block ${i} does not exist!", ("i", i) );
+            uint32_t dropped_count = 0;
+            while( true )
+            {
+               fc::optional< block_id_type > last_id = _block_id_to_block.last_id();
+               // this can trigger if we attempt to e.g. read a file that has block #2 but no block #1
+               if( !last_id.valid() )
+                  break;
+               // we've caught up to the gap
+               if( block_header::num_from_id( *last_id ) <= i )
+                  break;
+               _block_id_to_block.remove( *last_id );
+               dropped_count++;
+            }
+            wlog( "Dropped ${n} blocks from after the gap", ("n", dropped_count) );
+            next_block_num = last_block_num + 1; // don't load more blocks
+         }
       }
-      if( i < undo_point )
-         apply_block( *block, skip );
       else
       {
-         _undo_db.enable();
-         push_block( *block, skip );
+         blocks.front().second.wait();
+         const signed_block& block = blocks.front().first;
+
+         if( i % 10000 == 0 )
+         {
+            total_processed_block_size = _block_id_to_block.blocks_current_position();
+
+            ilog(
+               "   [by size: ${size}%   ${processed} of ${total}]   [by num: ${num}%   ${i} of ${last}]",
+               ("size", double(total_processed_block_size) / total_block_size * 100)
+               ("processed", total_processed_block_size)
+               ("total", total_block_size)
+               ("num", double(i*100)/last_block_num)
+               ("i", i)
+               ("last", last_block_num)
+            );
+         }
+         if( i == flush_point )
+         {
+            ilog( "Writing database to disk at block ${i}", ("i",i) );
+            flush();
+            ilog( "Done" );
+         }
+         if( head_block_time() >= now - gpo.parameters.maximum_time_until_expiration )
+            skip &= ~skip_transaction_dupe_check;
+         if( i < undo_point )
+            apply_block( block, skip );
+         else
+         {
+            _undo_db.enable();
+            push_block( block, skip );
+         }
+         blocks.pop();
+         i++;
       }
    }
    _undo_db.enable();
